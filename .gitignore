@@ -2,3 +2,4 @@
 __pycache__/
 *.pyc
 models/*.task
+PROJECT_BRIEF.md
