@@ -7,6 +7,8 @@ recorded at calibration time, and classify based on how far things have moved.
 import math
 from collections import Counter, deque
 
+import cv2
+
 # Landmark indices (Mediapipe Face Mesh / Face Landmarker topology).
 LEFT_EYE_OUTER = 33
 RIGHT_EYE_OUTER = 263
@@ -24,6 +26,8 @@ MOUTH_TOP_OUTER = 0
 MOUTH_BOTTOM_OUTER = 17
 MOUTH_INNER_LEFT = 78
 MOUTH_INNER_RIGHT = 308
+CHEEK_LEFT = 50
+CHEEK_RIGHT = 280
 
 STATE_NEUTRAL = "neutral"
 STATE_HAPPY = "happy"
@@ -31,13 +35,23 @@ STATE_SURPRISED = "surprised"
 STATE_CONFUSED = "confused"
 STATE_SILLY = "silly"
 
-# Tongue-out detection: the face mesh has no points on the tongue itself, so
-# geometry can't see it. Instead we sample pixel color inside the open mouth
-# and check whether it reads as pink/red (tongue) rather than dark (open
-# cavity) or white (teeth). MOUTH_OPEN_GATE avoids sampling lip color on a
-# closed/near-closed mouth.
-MOUTH_OPEN_GATE = 0.15
-TONGUE_REDNESS_THRESHOLD = 0.12
+# Mouth-content detection: the face mesh has no points on the tongue or teeth
+# themselves, so geometry can't see them. Instead we sample pixel color inside
+# the open mouth (in HSV, which is far more lighting-robust than raw RGB) and
+# check what fraction reads as pink/red (tongue) vs. white (teeth).
+# MOUTH_SAMPLE_GATE avoids sampling lip/skin color on a closed mouth.
+#
+# Tongue color is compared *relative to your own cheek skin* (sampled at
+# calibration time), not an absolute hue cutoff: skin tone and tongue color
+# sit in overlapping hue ranges, especially warmer skin tones, so a fixed
+# threshold reads ordinary mouth-corner/chin skin as "tongue" for some
+# people. Saturation - how vivid vs. pale a color is - is what actually
+# separates them: a tongue reads distinctly more saturated than resting skin.
+DEFAULT_SKIN_SATURATION = 60.0
+TONGUE_SATURATION_MARGIN = 35.0
+MOUTH_SAMPLE_GATE = 0.08
+TONGUE_FRACTION_THRESHOLD = 0.15
+TEETH_FRACTION_THRESHOLD = 0.10
 
 
 def _dist(a, b):
@@ -82,33 +96,79 @@ def compute_ratios(landmarks):
         "eyebrow_asym": eyebrow_asym,
         "eyebrow_furrow": eyebrow_furrow,
         "head_tilt": head_tilt,
+        "scale": d,  # raw (un-normalized) inter-eye distance, for callers that need it
     }
 
 
-def compute_tongue_redness(frame_bgr, landmarks, ratios):
-    """Rough color heuristic for 'tongue sticking out'. Samples the pixels
-    inside the open mouth and scores how pink/red they are. Returns 0.0 if
-    the mouth isn't open enough to bother sampling.
+def _hsv_patch(frame_bgr, x1, x2, y1, y2, w, h):
+    x1, x2 = int(max(0.0, x1) * w), int(min(1.0, x2) * w)
+    y1, y2 = int(max(0.0, y1) * h), int(min(1.0, y2) * h)
+    if x2 - x1 < 3 or y2 - y1 < 3:
+        return None
+    return cv2.cvtColor(frame_bgr[y1:y2, x1:x2], cv2.COLOR_BGR2HSV)
+
+
+def compute_skin_saturation(frame_bgr, landmarks):
+    """Average HSV saturation of a small patch on each cheek - the resting-skin
+    baseline that tongue detection compares against. Call during calibration
+    and average across a few frames.
     """
-    if ratios["mouth_open"] < MOUTH_OPEN_GATE:
-        return 0.0
+    h, w = frame_bgr.shape[:2]
+    lm = landmarks
+    radius = 0.02
+    sats = []
+    for idx in (CHEEK_LEFT, CHEEK_RIGHT):
+        cx, cy = lm[idx].x, lm[idx].y
+        patch = _hsv_patch(frame_bgr, cx - radius, cx + radius, cy - radius, cy + radius, w, h)
+        if patch is not None:
+            sats.append(float(patch[..., 1].mean()))
+    return sum(sats) / len(sats) if sats else DEFAULT_SKIN_SATURATION
+
+
+def sample_mouth_colors(frame_bgr, landmarks, ratios, skin_saturation=DEFAULT_SKIN_SATURATION):
+    """Samples pixels inside the mouth and returns (teeth_fraction, tongue_fraction) -
+    what fraction of the sampled patch reads as white (teeth) vs. pink/red and
+    notably more saturated than resting skin (tongue). Both are 0.0 if the
+    mouth isn't open enough to bother sampling.
+
+    Uses two different boxes: teeth are measured with a tight box right at
+    the mouth opening (a smile's teeth band sits exactly there - padding
+    would just dilute the fraction with skin/chin pixels), while tongue is
+    measured with a box padded well beyond it, especially downward, since a
+    protruding tongue extends past where the tracked inner-lip landmarks sit.
+    """
+    if ratios["mouth_open"] < MOUTH_SAMPLE_GATE:
+        return 0.0, 0.0
 
     h, w = frame_bgr.shape[:2]
     lm = landmarks
-    x1 = int(min(lm[MOUTH_INNER_LEFT].x, lm[MOUTH_INNER_RIGHT].x) * w)
-    x2 = int(max(lm[MOUTH_INNER_LEFT].x, lm[MOUTH_INNER_RIGHT].x) * w)
-    y1 = int(min(lm[MOUTH_UP_INNER].y, lm[MOUTH_LOW_INNER].y) * h)
-    y2 = int(max(lm[MOUTH_UP_INNER].y, lm[MOUTH_LOW_INNER].y) * h)
-    x1, y1 = max(0, x1), max(0, y1)
-    x2, y2 = min(w, x2), min(h, y2)
-    if x2 - x1 < 3 or y2 - y1 < 3:
-        return 0.0
+    x1 = min(lm[MOUTH_INNER_LEFT].x, lm[MOUTH_INNER_RIGHT].x)
+    x2 = max(lm[MOUTH_INNER_LEFT].x, lm[MOUTH_INNER_RIGHT].x)
+    y1 = min(lm[MOUTH_UP_INNER].y, lm[MOUTH_LOW_INNER].y)
+    y2 = max(lm[MOUTH_UP_INNER].y, lm[MOUTH_LOW_INNER].y)
+    box_w, box_h = x2 - x1, y2 - y1
 
-    patch = frame_bgr[y1:y2, x1:x2].reshape(-1, 3).astype(float)
-    b, g, r = patch[:, 0].mean(), patch[:, 1].mean(), patch[:, 2].mean()
-    if (r + g + b) / 3 < 25:  # too dark - likely open-cavity shadow, not tongue
-        return 0.0
-    return max(0.0, ((r - g) + (r - b)) / 255.0)
+    teeth_fraction = 0.0
+    teeth_hsv = _hsv_patch(frame_bgr, x1, x2, y1, y2, w, h)
+    if teeth_hsv is not None:
+        sat, val = teeth_hsv[..., 1].astype(float), teeth_hsv[..., 2].astype(float)
+        teeth_fraction = float(((sat < 90) & (val > 90)).mean())
+
+    tongue_fraction = 0.0
+    tongue_hsv = _hsv_patch(
+        frame_bgr, x1 - box_w * 0.15, x2 + box_w * 0.15, y1, y2 + box_h * 0.45, w, h
+    )
+    if tongue_hsv is not None:
+        hue = tongue_hsv[..., 0].astype(float)
+        sat, val = tongue_hsv[..., 1].astype(float), tongue_hsv[..., 2].astype(float)
+        is_tongue = (
+            ((hue < 20) | (hue > 160))
+            & (sat > skin_saturation + TONGUE_SATURATION_MARGIN)
+            & (val > 40)
+        )
+        tongue_fraction = float(is_tongue.mean())
+
+    return teeth_fraction, tongue_fraction
 
 
 class ExpressionDetector:
@@ -126,7 +186,7 @@ class ExpressionDetector:
         self._history.clear()
         self.confirmed_state = STATE_NEUTRAL
 
-    def classify_raw(self, ratios, tongue_redness=0.0):
+    def classify_raw(self, ratios, teeth_fraction=0.0, tongue_fraction=0.0):
         """Single-frame classification against baseline. Noisy by design -
         `update()` smooths this out over time."""
         if self.baseline is None:
@@ -135,16 +195,23 @@ class ExpressionDetector:
 
         # Checked first: an open mouth with tongue showing would otherwise
         # get misread as "surprised" (both involve a wide-open mouth).
-        if tongue_redness > TONGUE_REDNESS_THRESHOLD:
+        if tongue_fraction > TONGUE_FRACTION_THRESHOLD:
             return STATE_SILLY
 
-        is_surprised = (
-            ratios["mouth_open"] > b["mouth_open"] + 0.06
-            and ratios["eyebrow_raise"] > b["eyebrow_raise"] * 1.12
-        )
+        # Teeth visibility is the real "smiling" signal; mouth_width tells a
+        # smile (wide, corners pulled back) apart from a shocked wide-open
+        # mouth (drops vertically without necessarily widening) - both can
+        # show teeth, so this is what keeps them from colliding.
         is_happy = (
-            ratios["mouth_width"] > b["mouth_width"] * 1.10
-            and ratios["corner_raise"] > b["corner_raise"] + 0.015
+            teeth_fraction > TEETH_FRACTION_THRESHOLD
+            and ratios["mouth_width"] > b["mouth_width"] * 1.05
+        )
+        is_surprised = (
+            ratios["mouth_open"] > b["mouth_open"] + 0.10
+            or (
+                ratios["mouth_open"] > b["mouth_open"] + 0.05
+                and ratios["eyebrow_raise"] > b["eyebrow_raise"] * 1.10
+            )
         )
         is_confused = (
             ratios["eyebrow_furrow"] < b["eyebrow_furrow"] * 0.90
@@ -154,21 +221,21 @@ class ExpressionDetector:
 
         # Priority order matters when multiple trigger at once (e.g. a big
         # surprised face can also look "wide"). Tune thresholds above first.
-        if is_surprised:
-            return STATE_SURPRISED
         if is_happy:
             return STATE_HAPPY
+        if is_surprised:
+            return STATE_SURPRISED
         if is_confused:
             return STATE_CONFUSED
         return STATE_NEUTRAL
 
-    def update(self, ratios, tongue_redness=0.0):
+    def update(self, ratios, teeth_fraction=0.0, tongue_fraction=0.0):
         """Feed one frame's ratios in. Returns the current smoothed state.
 
         Uses majority vote over the last `smoothing_frames` frames so a
         single noisy frame can't flip the displayed reaction.
         """
-        raw = self.classify_raw(ratios, tongue_redness)
+        raw = self.classify_raw(ratios, teeth_fraction, tongue_fraction)
         self._history.append(raw)
 
         if len(self._history) == self._history.maxlen:

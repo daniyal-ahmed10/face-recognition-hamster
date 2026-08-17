@@ -13,7 +13,16 @@ import mediapipe as mp
 from mediapipe.tasks.python import BaseOptions
 from mediapipe.tasks.python import vision
 
-from detector import STATE_NEUTRAL, ExpressionDetector, compute_ratios, compute_tongue_redness
+from detector import (
+    DEFAULT_SKIN_SATURATION,
+    LEFT_EYE_OUTER,
+    RIGHT_EYE_OUTER,
+    STATE_NEUTRAL,
+    ExpressionDetector,
+    compute_ratios,
+    compute_skin_saturation,
+    sample_mouth_colors,
+)
 from gesture import GestureDetector, classify_gesture
 from popup import ReactionPopup
 
@@ -106,18 +115,20 @@ class App:
         self.popup = ReactionPopup(IMAGE_MAP, on_close=self._shutdown)
 
         self._calibration_samples = []
+        self._calibration_skin_samples = []
         self._calibration_start = None
         self._calibrated = False
         self._running = True
+        self.skin_saturation = DEFAULT_SKIN_SATURATION
 
         self.popup.show_state(STATE_NEUTRAL)
         self.popup.set_status("Starting camera...")
 
     def _process_frame(self):
-        """One webcam frame -> (frame, face ratios or None, raw gesture state or None)."""
+        """One webcam frame -> (frame, face ratios or None, (teeth_frac, tongue_frac), raw gesture state or None, skin saturation sample or None)."""
         ok, frame = self.cap.read()
         if not ok:
-            return None, None, None
+            return None, None, (0.0, 0.0), None, None
 
         frame = cv2.flip(frame, 1)
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -126,35 +137,44 @@ class App:
 
         face_result = self.face_landmarker.detect_for_video(mp_image, timestamp_ms)
         ratios = None
-        tongue_redness = 0.0
+        mouth_colors = (0.0, 0.0)
+        head_center = None
+        head_scale = None
+        skin_sample = None
         if face_result.face_landmarks:
             face_landmarks = face_result.face_landmarks[0]
             ratios = compute_ratios(face_landmarks)
-            tongue_redness = compute_tongue_redness(frame, face_landmarks, ratios)
+            mouth_colors = sample_mouth_colors(frame, face_landmarks, ratios, self.skin_saturation)
+            skin_sample = compute_skin_saturation(frame, face_landmarks)
+            head_center = (
+                (face_landmarks[LEFT_EYE_OUTER].x + face_landmarks[RIGHT_EYE_OUTER].x) / 2,
+                (face_landmarks[LEFT_EYE_OUTER].y + face_landmarks[RIGHT_EYE_OUTER].y) / 2,
+            )
+            head_scale = ratios["scale"]
 
         gesture_result = self.gesture_recognizer.recognize_for_video(mp_image, timestamp_ms)
         raw_gesture = None
         if gesture_result.gestures and gesture_result.gestures[0]:
             top_category = gesture_result.gestures[0][0]
             hand_landmarks = gesture_result.hand_landmarks[0] if gesture_result.hand_landmarks else None
-            raw_gesture = classify_gesture(top_category, hand_landmarks)
+            raw_gesture = classify_gesture(top_category, hand_landmarks, head_center, head_scale)
 
-        return frame, ratios, tongue_redness, raw_gesture
+        return frame, ratios, mouth_colors, raw_gesture, skin_sample
 
     def _tick(self):
         if not self._running:
             return
 
-        frame, ratios, tongue_redness, raw_gesture = self._process_frame()
+        frame, ratios, (teeth_fraction, tongue_fraction), raw_gesture, skin_sample = self._process_frame()
 
         if not self._calibrated:
             if ratios is not None:
-                self._run_calibration(ratios)
+                self._run_calibration(ratios, skin_sample)
         else:
             # A held gesture is a more deliberate signal than a facial
             # expression, so it takes priority when present.
             face_state = (
-                self.detector.update(ratios, tongue_redness)
+                self.detector.update(ratios, teeth_fraction, tongue_fraction)
                 if ratios is not None
                 else self.detector.confirmed_state
             )
@@ -174,17 +194,23 @@ class App:
         if self._running:
             self.popup.after(FRAME_INTERVAL_MS, self._tick)
 
-    def _run_calibration(self, ratios):
+    def _run_calibration(self, ratios, skin_sample):
         now = time.monotonic()
         if self._calibration_start is None:
             self._calibration_start = now
 
         self._calibration_samples.append(ratios)
+        if skin_sample is not None:
+            self._calibration_skin_samples.append(skin_sample)
         remaining = max(0.0, CALIBRATION_SECONDS - (now - self._calibration_start))
         self.popup.set_status(f"Calibrating... hold a neutral face ({remaining:.1f}s)")
 
         if remaining <= 0 and len(self._calibration_samples) >= 5:
             self.detector.calibrate(self._calibration_samples)
+            if self._calibration_skin_samples:
+                self.skin_saturation = sum(self._calibration_skin_samples) / len(
+                    self._calibration_skin_samples
+                )
             self._calibrated = True
             self.popup.set_status("Calibrated! Watching your face...")
             self.popup.show_state(STATE_NEUTRAL)
